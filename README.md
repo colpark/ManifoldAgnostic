@@ -49,20 +49,37 @@ This paradigm shift enables:
                          From noise → manifold
 ```
 
-### Two-Stage Processing (Inspired by PixNerd)
+### Architecture (PixNerd-style)
 
-1. **Global Encoder**: Aggregates shape-level context from input points
-   ```
-   points {p_i} → Transformer/PointNet → shape features s
-   ```
+The architecture directly follows PixNerd (Wang et al.), adapting it from 2D images to 3D point clouds:
 
-2. **Neural Field Generator**: Shape context generates the continuous field
+1. **Global DiT Blocks**: Extract shape context with 3D spatial awareness
    ```
-   s → HyperNetwork → MLP weights (w₁, w₂, ...)
-   (x, t) → Fourier encoding → MLP(weights) → v(x, t)
+   points {p_i} → PointEmbedder → DiT Blocks (RoPE + AdaLN + SwiGLU) → shape context s
    ```
+   - **3D RoPE**: Rotary position embeddings adapted for 3D coordinates
+   - **AdaLN**: Adaptive LayerNorm modulates attention/FFN based on timestep
+   - **SwiGLU**: Gated feedforward networks for expressiveness
 
-The key insight from PixNerd's NerfBlock: the **hyper-network generates MLP weights** that define a continuous function, enabling evaluation at any coordinate.
+2. **NerfBlocks (HyperNetwork)**: Shape context generates the neural field
+   ```
+   s → weight generators → MLP weights (with F.normalize for stability)
+   (x, t) → Fourier encoding → batched MLP(weights) → v(x, t)
+   ```
+   - **Weight Normalization**: Critical for stable hyper-network training
+   - **Per-point Processing**: Each point processed independently with shared weights
+
+### Key PixNerd Components Adapted for 3D
+
+| Component | PixNerd (2D) | ManifoldAgnostic (3D) |
+|-----------|--------------|----------------------|
+| Position Encoding | 2D DCT | 3D Fourier |
+| RoPE | 2D (x,y) | 3D (x,y,z) |
+| Patchify | unfold(image) | Direct points |
+| Output | RGB (3ch) | Velocity (3D) |
+| NerfBlock | Per-patch MLP | Per-point MLP |
+
+The key insight from PixNerd's NerfBlock: the **hyper-network generates normalized MLP weights** that define a continuous function, enabling evaluation at any coordinate.
 
 ## Mathematical Framework
 
@@ -131,22 +148,29 @@ curvature = ∇²v_θ(x, 0)
 ```
 ManifoldAgnostic/
 ├── README.md
+├── requirements.txt             # Dependencies (torch, numpy, etc.)
 ├── data/
-│   └── toy_data.py          # Toy dataset generation
+│   ├── __init__.py
+│   └── toy_data.py              # Toy dataset (13 shapes across 1D/2D/3D)
 ├── notebooks/
-│   └── visualize_data.ipynb # Data visualization
+│   ├── visualize_data.ipynb     # Data visualization
+│   └── train_and_test.ipynb     # Training notebook
 ├── src/
 │   ├── models/
-│   │   ├── neural_field.py  # Core neural field module
-│   │   ├── hyper_network.py # Weight-generating network
-│   │   └── encoder.py       # Point cloud encoder
+│   │   ├── __init__.py
+│   │   └── neural_field.py      # PixNerd-style model:
+│   │                            #   - RMSNorm, SwiGLU, TimestepEmbedder
+│   │                            #   - RoPEAttention3D, DiTBlock3D
+│   │                            #   - NerfEmbedder3D, NerfBlock
+│   │                            #   - NeuralFieldDiffusion (main model)
 │   ├── diffusion/
-│   │   ├── flow_matching.py # Training objective
-│   │   └── sampling.py      # ODE integration
+│   │   ├── __init__.py
+│   │   └── flow_matching.py     # FlowMatchingLoss, FlowMatchingSampler
 │   └── utils/
-│       └── geometry.py      # Geometric utilities
+│       └── __init__.py
 └── experiments/
-    └── train_toy.py         # Training script
+    ├── train_toy.py             # CLI training script
+    └── outputs/                 # Training outputs (samples, checkpoints)
 ```
 
 ## Roadmap

@@ -339,20 +339,21 @@ def main():
     parser.add_argument('--n_samples', type=int, default=1000,
                         help='Number of training samples')
 
-    # Model
-    parser.add_argument('--encoder', type=str, default='pointnet',
-                        choices=['pointnet', 'transformer'],
-                        help='Encoder type')
-    parser.add_argument('--d_hidden', type=int, default=128,
-                        help='Hidden dimension')
-    parser.add_argument('--d_context', type=int, default=256,
-                        help='Context dimension')
-    parser.add_argument('--n_frequencies', type=int, default=8,
+    # Model (PixNerd-style architecture)
+    parser.add_argument('--hidden_size', type=int, default=384,
+                        help='Transformer hidden dimension')
+    parser.add_argument('--hidden_size_x', type=int, default=64,
+                        help='NerfBlock hidden dimension')
+    parser.add_argument('--num_heads', type=int, default=6,
+                        help='Number of attention heads')
+    parser.add_argument('--num_blocks', type=int, default=12,
+                        help='Total number of blocks')
+    parser.add_argument('--num_cond_blocks', type=int, default=4,
+                        help='Number of DiT blocks (rest are NerfBlocks)')
+    parser.add_argument('--nerf_mlp_ratio', type=int, default=4,
+                        help='MLP ratio for NerfBlocks')
+    parser.add_argument('--max_freqs', type=int, default=8,
                         help='Fourier frequency bands')
-    parser.add_argument('--field_hidden', type=int, default=128,
-                        help='Field MLP hidden dimension')
-    parser.add_argument('--field_layers', type=int, default=4,
-                        help='Field MLP layers')
 
     # Training
     parser.add_argument('--epochs', type=int, default=500,
@@ -401,15 +402,18 @@ def main():
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # Create model
-    print(f"\nCreating model: {args.encoder} encoder")
+    # Create model (PixNerd-style)
+    print(f"\nCreating model: PixNerd-style DiT + NerfBlocks")
     model = NeuralFieldDiffusion(
-        encoder_type=args.encoder,
-        d_hidden=args.d_hidden,
-        d_context=args.d_context,
-        n_frequencies=args.n_frequencies,
-        field_hidden=args.field_hidden,
-        field_layers=args.field_layers
+        in_channels=3,
+        out_channels=3,
+        hidden_size=args.hidden_size,
+        hidden_size_x=args.hidden_size_x,
+        num_heads=args.num_heads,
+        num_blocks=args.num_blocks,
+        num_cond_blocks=args.num_cond_blocks,
+        nerf_mlp_ratio=args.nerf_mlp_ratio,
+        max_freqs=args.max_freqs,
     )
 
     n_params = sum(p.numel() for p in model.parameters())

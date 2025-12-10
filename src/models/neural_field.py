@@ -1,552 +1,760 @@
 """
-Neural Field Module for Point Cloud Diffusion
+Neural Field Diffusion Model for 3D Point Clouds
 
-The core innovation: learns a continuous vector field v_θ: ℝ³ × [0,T] → ℝ³
-that can be queried at ANY spatial location, not just training points.
+Architecture closely follows PixNerd (Wang et al.):
+- RMSNorm for normalization
+- SwiGLU feedforward networks
+- RoPE (Rotary Position Embedding) for 3D
+- AdaLN modulation for condition injection
+- DiT-style transformer blocks for global processing
+- NerfBlock hyper-network for local neural field
 
-Architecture:
-1. Global Encoder: points → shape context s
-2. HyperNetwork: s → MLP weights
-3. Neural Field: (x, t, weights) → velocity v(x, t)
+Key adaptation from 2D images to 3D point clouds:
+- Each point is treated as a token (like a patch in PixNerd)
+- 3D RoPE instead of 2D RoPE
+- 3D Fourier position encoding instead of 2D DCT
+- Output is velocity v(x,t) ∈ ℝ³ instead of RGB
 """
+
+import math
+from typing import Tuple, Optional
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from typing import Optional, Tuple
+from torch.nn.functional import scaled_dot_product_attention
 
 
-class FourierPositionEncoder(nn.Module):
+# =============================================================================
+# UTILITY FUNCTIONS (from PixNerd)
+# =============================================================================
+
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """AdaLN modulation: x * (1 + scale) + shift"""
+    return x * (1 + scale) + shift
+
+
+# =============================================================================
+# NORMALIZATION (from PixNerd)
+# =============================================================================
+
+class RMSNorm(nn.Module):
     """
-    3D Fourier position encoding for continuous spatial coordinates.
-
-    Maps (x, y, z) ∈ ℝ³ to high-dimensional feature space using
-    sinusoidal functions at multiple frequencies.
-
-    This enables the neural field to learn high-frequency details
-    while maintaining smoothness.
+    Root Mean Square Layer Normalization (from LLaMA).
+    More efficient than LayerNorm, used throughout PixNerd.
     """
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
 
-    def __init__(self, d_input: int = 3, n_frequencies: int = 10,
-                 include_input: bool = True):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return self.weight * x.to(input_dtype)
+
+
+# =============================================================================
+# FEEDFORWARD (SwiGLU from PixNerd)
+# =============================================================================
+
+class SwiGLUFeedForward(nn.Module):
+    """
+    SwiGLU feedforward network (from LLaMA/PixNerd).
+    FFN(x) = W2(SiLU(W1(x)) * W3(x))
+    """
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        # Following PixNerd: hidden_dim = int(2 * hidden_dim / 3)
+        hidden_dim = int(2 * hidden_dim / 3)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+# =============================================================================
+# EMBEDDINGS (adapted from PixNerd)
+# =============================================================================
+
+class TimestepEmbedder(nn.Module):
+    """
+    Sinusoidal timestep embedding (from PixNerd).
+    Maps scalar timestep t to high-dimensional embedding.
+    """
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10.0) -> torch.Tensor:
+        """Create sinusoidal timestep embeddings."""
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(0, half, dtype=torch.float32, device=t.device) / half
+        )
+        args = t[..., None].float() * freqs[None, ...]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq)
+
+
+class PointEmbedder(nn.Module):
+    """
+    Embed 3D point coordinates into hidden dimension.
+    Analogous to PixNerd's patch embedding (s_embedder).
+    """
+    def __init__(self, in_channels: int = 3, embed_dim: int = 768):
+        super().__init__()
+        self.proj = nn.Linear(in_channels, embed_dim, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+# =============================================================================
+# 3D ROTARY POSITION EMBEDDING (adapted from PixNerd's 2D RoPE)
+# =============================================================================
+
+def precompute_freqs_cis_3d(dim: int, max_points: int, theta: float = 10000.0) -> torch.Tensor:
+    """
+    Precompute 3D rotary position embeddings.
+
+    Adapts PixNerd's 2D RoPE to 3D by using xyz coordinates directly.
+    Each point's position is encoded using its 3D coordinates.
+
+    Args:
+        dim: Head dimension (must be divisible by 6 for xyz pairs)
+        max_points: Maximum number of points (for precomputation)
+        theta: Base frequency
+
+    Returns:
+        Complex tensor for rotary embeddings
+    """
+    # For 3D, we need dim divisible by 6 (x, y, z each get dim/3, and complex needs pairs)
+    assert dim % 6 == 0, f"Head dim {dim} must be divisible by 6 for 3D RoPE"
+
+    dim_per_axis = dim // 3  # Each axis gets 1/3 of dimensions
+    half_dim = dim_per_axis // 2  # Each axis uses complex pairs
+
+    freqs = 1.0 / (theta ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim))
+
+    return freqs
+
+
+def apply_rotary_emb_3d(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    positions: torch.Tensor,
+    freqs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply 3D rotary embeddings to query and key tensors.
+
+    Args:
+        xq: Query tensor [B, N, H, D]
+        xk: Key tensor [B, N, H, D]
+        positions: 3D positions [B, N, 3]
+        freqs: Precomputed frequencies
+
+    Returns:
+        Rotated query and key tensors
+    """
+    B, N, H, D = xq.shape
+    device = xq.device
+    dtype = xq.dtype
+
+    freqs = freqs.to(device)
+    dim_per_axis = D // 3
+    half_dim = dim_per_axis // 2
+
+    # Split positions into x, y, z
+    x_pos = positions[..., 0:1]  # [B, N, 1]
+    y_pos = positions[..., 1:2]  # [B, N, 1]
+    z_pos = positions[..., 2:3]  # [B, N, 1]
+
+    # Compute angles for each axis
+    x_angles = x_pos * freqs[None, None, :]  # [B, N, half_dim]
+    y_angles = y_pos * freqs[None, None, :]
+    z_angles = z_pos * freqs[None, None, :]
+
+    # Create complex rotations
+    x_cis = torch.polar(torch.ones_like(x_angles), x_angles)  # [B, N, half_dim]
+    y_cis = torch.polar(torch.ones_like(y_angles), y_angles)
+    z_cis = torch.polar(torch.ones_like(z_angles), z_angles)
+
+    # Concatenate all rotations
+    freqs_cis = torch.cat([x_cis, y_cis, z_cis], dim=-1)  # [B, N, D//2]
+    freqs_cis = freqs_cis[:, :, None, :]  # [B, N, 1, D//2] for broadcasting over heads
+
+    # Apply to queries and keys
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+
+    xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(-2)
+    xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(-2)
+
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# =============================================================================
+# ATTENTION WITH 3D ROPE (adapted from PixNerd's RAttention)
+# =============================================================================
+
+class RoPEAttention3D(nn.Module):
+    """
+    Multi-head attention with 3D Rotary Position Embeddings.
+    Adapted from PixNerd's RAttention for 3D point clouds.
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_norm: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # Ensure head_dim is divisible by 6 for 3D RoPE
+        # If not, we'll pad internally
+        self.rope_dim = (self.head_dim // 6) * 6
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = RMSNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Precompute RoPE frequencies
+        if self.rope_dim > 0:
+            self.register_buffer(
+                'rope_freqs',
+                precompute_freqs_cis_3d(self.rope_dim, max_points=4096)
+            )
+        else:
+            self.rope_freqs = None
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            d_input: Input dimension (3 for 3D points)
-            n_frequencies: Number of frequency bands
-            include_input: Whether to include raw input in output
+            x: Input features [B, N, C]
+            positions: 3D positions [B, N, 3]
+            mask: Optional attention mask
         """
+        B, N, C = x.shape
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 1, 3, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, N, H, D]
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # Apply 3D RoPE if available
+        if self.rope_freqs is not None and self.rope_dim > 0:
+            # Only apply to first rope_dim dimensions
+            q_rope = q[..., :self.rope_dim]
+            k_rope = k[..., :self.rope_dim]
+            q_rope, k_rope = apply_rotary_emb_3d(q_rope, k_rope, positions, self.rope_freqs)
+            q = torch.cat([q_rope, q[..., self.rope_dim:]], dim=-1)
+            k = torch.cat([k_rope, k[..., self.rope_dim:]], dim=-1)
+
+        # Reshape for attention: [B, H, N, D]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Scaled dot-product attention
+        x = scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+# =============================================================================
+# DiT BLOCK (from PixNerd's FlattenDiTBlock)
+# =============================================================================
+
+class DiTBlock3D(nn.Module):
+    """
+    DiT block with AdaLN modulation for 3D point clouds.
+    Directly adapted from PixNerd's FlattenDiTBlock.
+
+    Structure:
+    1. AdaLN-modulated self-attention with 3D RoPE
+    2. AdaLN-modulated SwiGLU feedforward
+    """
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
-        self.d_input = d_input
-        self.n_frequencies = n_frequencies
-        self.include_input = include_input
 
-        # Frequency bands: 2^0, 2^1, ..., 2^(n_frequencies-1)
-        freqs = 2.0 ** torch.arange(n_frequencies)
+        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.attn = RoPEAttention3D(hidden_size, num_heads=num_heads, qkv_bias=False)
+        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = SwiGLUFeedForward(hidden_size, mlp_hidden_dim)
+
+        # AdaLN modulation: 6 params (shift, scale, gate) × 2 (attn, mlp)
+        self.adaLN_modulation = nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor,
+                positions: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input features [B, N, C]
+            c: Condition embedding [B, 1, C] or [B, C]
+            positions: 3D positions [B, N, 3]
+            mask: Optional attention mask
+        """
+        # Get modulation parameters
+        if c.dim() == 2:
+            c = c.unsqueeze(1)
+
+        mod = self.adaLN_modulation(c)  # [B, 1, 6*C]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
+
+        # Attention with modulation
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), positions, mask)
+
+        # FFN with modulation
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+
+        return x
+
+
+# =============================================================================
+# NERF EMBEDDER (adapted from PixNerd for 3D)
+# =============================================================================
+
+class NerfEmbedder3D(nn.Module):
+    """
+    3D position encoding for neural field queries.
+    Adapted from PixNerd's NerfEmbedder (2D DCT) to 3D Fourier features.
+
+    Instead of 2D DCT: cos(x*fx*π) * cos(y*fy*π) * (1+fx*fy)^-1
+    We use 3D Fourier: sin/cos of x*freq, y*freq, z*freq with learned weighting.
+    """
+    def __init__(self, in_channels: int, hidden_size: int, max_freqs: int = 8):
+        super().__init__()
+        self.max_freqs = max_freqs
+        self.hidden_size = hidden_size
+
+        # 3D Fourier features: for each freq, we have sin and cos for x, y, z
+        # Total: max_freqs * 2 (sin/cos) * 3 (xyz) = max_freqs * 6
+        fourier_dim = max_freqs * 6
+
+        self.embedder = nn.Sequential(
+            nn.Linear(in_channels + fourier_dim, hidden_size, bias=True),
+        )
+
+        # Precompute frequencies
+        freqs = torch.arange(1, max_freqs + 1, dtype=torch.float32) * math.pi
         self.register_buffer('freqs', freqs)
-
-        # Output dimension
-        self.d_output = d_input * n_frequencies * 2  # sin + cos
-        if include_input:
-            self.d_output += d_input
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Input coordinates [..., d_input]
+            x: 3D coordinates [B, N, 3]
 
         Returns:
-            Encoded features [..., d_output]
+            Position-encoded features [B, N, hidden_size]
         """
-        # x: [..., 3]
-        # freqs: [n_frequencies]
+        B, N, _ = x.shape
 
-        # Compute x * freq for all frequencies
-        # [..., 3, 1] * [n_frequencies] -> [..., 3, n_frequencies]
-        x_freq = x.unsqueeze(-1) * self.freqs * math.pi
+        # Compute Fourier features
+        # x: [B, N, 3], freqs: [max_freqs]
+        # x_scaled: [B, N, 3, max_freqs]
+        x_scaled = x.unsqueeze(-1) * self.freqs[None, None, None, :]
 
-        # Flatten and apply sin/cos
-        x_freq = x_freq.reshape(*x.shape[:-1], -1)  # [..., 3*n_frequencies]
+        # Sin and cos for each coordinate
+        fourier_sin = torch.sin(x_scaled).reshape(B, N, -1)  # [B, N, 3*max_freqs]
+        fourier_cos = torch.cos(x_scaled).reshape(B, N, -1)  # [B, N, 3*max_freqs]
 
-        encoded = torch.cat([torch.sin(x_freq), torch.cos(x_freq)], dim=-1)
+        # Concatenate raw coordinates and Fourier features
+        features = torch.cat([x, fourier_sin, fourier_cos], dim=-1)  # [B, N, 3 + 6*max_freqs]
 
-        if self.include_input:
-            encoded = torch.cat([x, encoded], dim=-1)
-
-        return encoded
+        return self.embedder(features)
 
 
-class SinusoidalTimeEmbedding(nn.Module):
+# =============================================================================
+# NERF BLOCK (from PixNerd - hyper-network for neural field)
+# =============================================================================
+
+class NerfBlock(nn.Module):
     """
-    Sinusoidal embedding for diffusion timestep.
+    HyperNetwork block that generates MLP weights from shape context.
+    Directly from PixNerd with weight normalization.
 
-    Maps scalar t ∈ [0, 1] to high-dimensional feature space.
+    This is the core of the neural field: the generated MLP defines
+    a continuous function over 3D space.
+
+    Structure:
+    1. Shape context s generates MLP weights
+    2. Weights are normalized (critical for stability)
+    3. MLP is applied to position-encoded features
     """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            t: Timesteps [...] or [..., 1]
-
-        Returns:
-            Time embeddings [..., dim]
-        """
-        if t.dim() == 0:
-            t = t.unsqueeze(0)
-        if t.shape[-1] != 1:
-            t = t.unsqueeze(-1)
-
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
-        emb = t * emb
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-
-        return emb
-
-
-class PointNetEncoder(nn.Module):
-    """
-    PointNet-style encoder for extracting global shape features.
-
-    Uses shared MLPs followed by max pooling to get a permutation-invariant
-    global feature vector that summarizes the entire point cloud shape.
-    """
-
-    def __init__(self, d_input: int = 3, d_hidden: int = 128, d_output: int = 256):
-        """
-        Args:
-            d_input: Input point dimension (3 for xyz)
-            d_hidden: Hidden layer dimension
-            d_output: Output global feature dimension
-        """
+    def __init__(self, hidden_size_s: int, hidden_size_x: int, mlp_ratio: int = 4):
         super().__init__()
 
-        # Shared MLP layers (applied per-point)
-        self.mlp1 = nn.Sequential(
-            nn.Linear(d_input, d_hidden),
-            nn.LayerNorm(d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, d_hidden),
-            nn.LayerNorm(d_hidden),
-            nn.GELU(),
+        self.hidden_size_x = hidden_size_x
+        self.mlp_ratio = mlp_ratio
+
+        # Weight generator: generates both fc1 and fc2 weights
+        # fc1: hidden_size_x -> hidden_size_x * mlp_ratio
+        # fc2: hidden_size_x * mlp_ratio -> hidden_size_x
+        self.param_generator = nn.Linear(
+            hidden_size_s,
+            2 * hidden_size_x * hidden_size_x * mlp_ratio,
+            bias=True
         )
 
-        self.mlp2 = nn.Sequential(
-            nn.Linear(d_hidden, d_hidden * 2),
-            nn.LayerNorm(d_hidden * 2),
-            nn.GELU(),
-            nn.Linear(d_hidden * 2, d_output),
-            nn.LayerNorm(d_output),
-        )
+        self.norm = RMSNorm(hidden_size_x, eps=1e-6)
 
-        self.d_output = d_output
-
-    def forward(self, points: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            points: Point cloud [B, N, 3]
+            x: Position-encoded features [B*N, P, hidden_size_x] or [B, N, hidden_size_x]
+            s: Shape context [B*N, hidden_size_s] or [B, hidden_size_s]
 
         Returns:
-            Global shape features [B, d_output]
+            Transformed features, same shape as input
         """
-        # Per-point features
-        x = self.mlp1(points)  # [B, N, d_hidden]
-        x = self.mlp2(x)       # [B, N, d_output]
+        if x.dim() == 3 and s.dim() == 2:
+            # Standard case: x is [B, N, C], s is [B, C_s]
+            # We need to expand s to match x
+            B, N, C = x.shape
+            s = s.unsqueeze(1).expand(-1, N, -1).reshape(B * N, -1)
+            x = x.reshape(B * N, 1, C)
+            needs_reshape = True
+        else:
+            needs_reshape = False
+            B_times_N = x.shape[0]
 
-        # Global max pooling (permutation invariant)
-        global_feat = x.max(dim=1)[0]  # [B, d_output]
+        batch_size = x.shape[0]
 
-        return global_feat
+        # Generate MLP weights
+        mlp_params = self.param_generator(s)  # [batch, 2*C*C*ratio]
+        fc1_param, fc2_param = mlp_params.chunk(2, dim=-1)
+
+        # Reshape weights
+        fc1_param = fc1_param.view(batch_size, self.hidden_size_x, self.hidden_size_x * self.mlp_ratio)
+        fc2_param = fc2_param.view(batch_size, self.hidden_size_x * self.mlp_ratio, self.hidden_size_x)
+
+        # CRITICAL: Normalize weights (from PixNerd)
+        # This is essential for stable training with hyper-networks
+        fc1_param = F.normalize(fc1_param, dim=-2)
+        fc2_param = F.normalize(fc2_param, dim=-2)
+
+        # Apply MLP with residual
+        res_x = x
+        x = self.norm(x)
+        x = torch.bmm(x, fc1_param)  # [batch, seq, C*ratio]
+        x = F.silu(x)
+        x = torch.bmm(x, fc2_param)  # [batch, seq, C]
+        x = x + res_x
+
+        if needs_reshape:
+            x = x.reshape(B, N, -1)
+
+        return x
 
 
-class TransformerEncoder(nn.Module):
+# =============================================================================
+# FINAL LAYER (from PixNerd)
+# =============================================================================
+
+class NerfFinalLayer(nn.Module):
     """
-    Transformer-based encoder for global shape features.
-
-    Uses self-attention to capture point relationships, then pools
-    to get a global shape descriptor.
-
-    More expressive than PointNet but O(N²) complexity.
+    Final layer for neural field output.
+    From PixNerd: RMSNorm + Linear projection to output channels.
     """
-
-    def __init__(self, d_input: int = 3, d_model: int = 128,
-                 n_heads: int = 4, n_layers: int = 2, d_output: int = 256):
+    def __init__(self, hidden_size: int, out_channels: int):
         super().__init__()
+        self.norm = RMSNorm(hidden_size, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, out_channels, bias=True)
 
-        # Input projection
-        self.input_proj = nn.Linear(d_input, d_model)
-
-        # Transformer layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_model * 4,
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-        # Output projection
-        self.output_proj = nn.Sequential(
-            nn.Linear(d_model, d_output),
-            nn.LayerNorm(d_output),
-        )
-
-        self.d_output = d_output
-
-    def forward(self, points: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            points: Point cloud [B, N, 3]
-
-        Returns:
-            Global shape features [B, d_output]
-        """
-        x = self.input_proj(points)  # [B, N, d_model]
-        x = self.transformer(x)       # [B, N, d_model]
-
-        # Global pooling (mean + max)
-        x_mean = x.mean(dim=1)
-        x_max = x.max(dim=1)[0]
-        global_feat = self.output_proj(x_mean + x_max)  # [B, d_output]
-
-        return global_feat
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        x = self.linear(x)
+        return x
 
 
-class HyperNetwork(nn.Module):
-    """
-    HyperNetwork that generates MLP weights from shape context.
-
-    This is the key to neural field diffusion:
-    - Takes global shape features s
-    - Outputs weights for the neural field MLP
-    - The generated MLP defines a continuous function over ℝ³
-
-    Inspired by PixNerd's NerfBlock architecture.
-    """
-
-    def __init__(self, d_context: int = 256, d_time: int = 64,
-                 field_hidden: int = 128, field_layers: int = 3):
-        """
-        Args:
-            d_context: Dimension of shape context
-            d_time: Dimension of time embedding
-            field_hidden: Hidden dimension of generated MLP
-            field_layers: Number of layers in generated MLP
-        """
-        super().__init__()
-
-        self.field_hidden = field_hidden
-        self.field_layers = field_layers
-
-        # Time embedding
-        self.time_embed = SinusoidalTimeEmbedding(d_time)
-
-        # Combine context and time
-        self.context_proj = nn.Sequential(
-            nn.Linear(d_context + d_time, d_context),
-            nn.LayerNorm(d_context),
-            nn.GELU(),
-            nn.Linear(d_context, d_context),
-            nn.LayerNorm(d_context),
-            nn.GELU(),
-        )
-
-        # Calculate total parameters needed for field MLP
-        # Layer sizes: [d_pos_enc, hidden, hidden, ..., 3]
-        # We'll set d_pos_enc at runtime based on position encoder
-        self.d_pos_enc = None  # Set during first forward
-
-        # Weight generators for each layer
-        # Will be initialized lazily
-        self.weight_generators = None
-        self.bias_generators = None
-        self.d_context = d_context
-
-    def _init_generators(self, d_pos_enc: int, device):
-        """Initialize weight generators based on position encoding dim."""
-        self.d_pos_enc = d_pos_enc
-
-        # Layer dimensions
-        dims = [d_pos_enc] + [self.field_hidden] * (self.field_layers - 1) + [3]
-
-        self.weight_generators = nn.ModuleList()
-        self.bias_generators = nn.ModuleList()
-
-        for i in range(len(dims) - 1):
-            d_in, d_out = dims[i], dims[i + 1]
-            # Each generator outputs flattened weight matrix
-            self.weight_generators.append(
-                nn.Linear(self.d_context, d_in * d_out)
-            )
-            self.bias_generators.append(
-                nn.Linear(self.d_context, d_out)
-            )
-
-        self.weight_generators = self.weight_generators.to(device)
-        self.bias_generators = self.bias_generators.to(device)
-
-        # Store dimensions for later
-        self.layer_dims = dims
-
-    def forward(self, context: torch.Tensor, t: torch.Tensor,
-                d_pos_enc: int) -> Tuple[list, list]:
-        """
-        Generate MLP weights from shape context and time.
-
-        Args:
-            context: Shape context [B, d_context]
-            t: Diffusion timestep [B] or scalar
-            d_pos_enc: Dimension of position encoding
-
-        Returns:
-            weights: List of weight matrices for each layer
-            biases: List of bias vectors for each layer
-        """
-        B = context.shape[0]
-        device = context.device
-
-        # Initialize generators if needed
-        if self.weight_generators is None or self.d_pos_enc != d_pos_enc:
-            self._init_generators(d_pos_enc, device)
-
-        # Time embedding
-        if t.dim() == 0:
-            t = t.expand(B)
-        t_emb = self.time_embed(t)  # [B, d_time]
-
-        # Combine context and time
-        combined = torch.cat([context, t_emb], dim=-1)  # [B, d_context + d_time]
-        combined = self.context_proj(combined)  # [B, d_context]
-
-        # Generate weights and biases
-        weights = []
-        biases = []
-
-        for i, (wg, bg) in enumerate(zip(self.weight_generators, self.bias_generators)):
-            d_in, d_out = self.layer_dims[i], self.layer_dims[i + 1]
-
-            # Generate and reshape weights
-            w = wg(combined)  # [B, d_in * d_out]
-            w = w.view(B, d_out, d_in)  # [B, d_out, d_in]
-
-            # Normalize weights for stability (from PixNerd)
-            w = F.normalize(w, dim=-1)
-
-            # Generate biases
-            b = bg(combined)  # [B, d_out]
-
-            weights.append(w)
-            biases.append(b)
-
-        return weights, biases
-
-
-class NeuralFieldMLP(nn.Module):
-    """
-    The neural field MLP that maps position encodings to velocities.
-
-    Uses dynamically generated weights from HyperNetwork.
-    This allows the same architecture to represent different shapes.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x: torch.Tensor, weights: list, biases: list) -> torch.Tensor:
-        """
-        Apply the neural field MLP with given weights.
-
-        Args:
-            x: Position encodings [B, N, d_pos_enc]
-            weights: List of weight matrices [B, d_out, d_in]
-            biases: List of bias vectors [B, d_out]
-
-        Returns:
-            Velocities [B, N, 3]
-        """
-        # x: [B, N, d_in]
-
-        for i, (w, b) in enumerate(zip(weights, biases)):
-            # Batched matrix multiply: [B, N, d_in] @ [B, d_in, d_out] -> [B, N, d_out]
-            x = torch.bmm(x, w.transpose(-1, -2)) + b.unsqueeze(1)
-
-            # Apply activation (except last layer)
-            if i < len(weights) - 1:
-                x = F.gelu(x)
-
-        return x  # [B, N, 3]
-
+# =============================================================================
+# MAIN MODEL (adapted from PixNerd's PixNerDiT)
+# =============================================================================
 
 class NeuralFieldDiffusion(nn.Module):
     """
-    Complete Neural Field Diffusion Model.
+    Neural Field Diffusion Model for 3D Point Clouds.
 
-    Combines:
-    1. Point cloud encoder (PointNet or Transformer)
-    2. Position encoder (Fourier features)
-    3. HyperNetwork (generates field weights)
-    4. Neural field MLP (maps positions to velocities)
+    Architecture follows PixNerd closely:
+    1. Point embedding (like patch embedding)
+    2. Timestep + condition embedding
+    3. Global DiT blocks with 3D RoPE and AdaLN
+    4. Local NerfBlocks (hyper-network) for neural field
+    5. Final layer projects to velocity output
 
-    The model learns v_θ: ℝ³ × [0,T] → ℝ³, a continuous vector field
-    that can be evaluated at ANY spatial location.
+    The key insight from PixNerd: global transformer provides shape context,
+    which is used by the hyper-network to generate a continuous neural field.
     """
-
-    def __init__(self,
-                 encoder_type: str = 'pointnet',
-                 d_hidden: int = 128,
-                 d_context: int = 256,
-                 n_frequencies: int = 10,
-                 field_hidden: int = 128,
-                 field_layers: int = 3,
-                 transformer_layers: int = 2,
-                 transformer_heads: int = 4):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        hidden_size: int = 384,
+        hidden_size_x: int = 64,
+        num_heads: int = 6,
+        num_blocks: int = 12,
+        num_cond_blocks: int = 4,
+        nerf_mlp_ratio: int = 4,
+        mlp_ratio: float = 4.0,
+        max_freqs: int = 8,
+        num_classes: int = 0,
+    ):
         """
         Args:
-            encoder_type: 'pointnet' or 'transformer'
-            d_hidden: Hidden dimension for encoder
-            d_context: Dimension of shape context
-            n_frequencies: Number of Fourier frequency bands
-            field_hidden: Hidden dimension of neural field MLP
-            field_layers: Number of layers in neural field MLP
-            transformer_layers: Number of transformer layers (if using transformer)
-            transformer_heads: Number of attention heads (if using transformer)
+            in_channels: Input point dimension (3 for xyz)
+            out_channels: Output dimension (3 for velocity)
+            hidden_size: Hidden dimension for transformer
+            hidden_size_x: Hidden dimension for NerfBlocks
+            num_heads: Number of attention heads
+            num_blocks: Total number of blocks
+            num_cond_blocks: Number of DiT blocks (rest are NerfBlocks)
+            nerf_mlp_ratio: MLP ratio for NerfBlocks
+            mlp_ratio: MLP ratio for DiT blocks
+            max_freqs: Max frequencies for position encoding
+            num_classes: Number of classes for conditional generation (0 = unconditional)
         """
         super().__init__()
 
-        # Position encoder
-        self.pos_encoder = FourierPositionEncoder(
-            d_input=3,
-            n_frequencies=n_frequencies,
-            include_input=True
-        )
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden_size = hidden_size
+        self.hidden_size_x = hidden_size_x
+        self.num_heads = num_heads
+        self.num_blocks = num_blocks
+        self.num_cond_blocks = num_cond_blocks
 
-        # Point cloud encoder
-        if encoder_type == 'pointnet':
-            self.encoder = PointNetEncoder(
-                d_input=3,
-                d_hidden=d_hidden,
-                d_output=d_context
-            )
-        elif encoder_type == 'transformer':
-            self.encoder = TransformerEncoder(
-                d_input=3,
-                d_model=d_hidden,
-                n_heads=transformer_heads,
-                n_layers=transformer_layers,
-                d_output=d_context
-            )
+        # Point embedding (analogous to s_embedder in PixNerd)
+        self.point_embedder = PointEmbedder(in_channels, hidden_size)
+
+        # Position encoding for NerfBlocks
+        self.nerf_embedder = NerfEmbedder3D(in_channels, hidden_size_x, max_freqs)
+
+        # Timestep embedding
+        self.t_embedder = TimestepEmbedder(hidden_size)
+
+        # Optional class embedding
+        self.num_classes = num_classes
+        if num_classes > 0:
+            self.y_embedder = nn.Embedding(num_classes + 1, hidden_size)  # +1 for unconditional
         else:
-            raise ValueError(f"Unknown encoder type: {encoder_type}")
+            self.y_embedder = None
 
-        # HyperNetwork
-        self.hyper_net = HyperNetwork(
-            d_context=d_context,
-            d_time=64,
-            field_hidden=field_hidden,
-            field_layers=field_layers
-        )
+        # Build blocks
+        self.blocks = nn.ModuleList()
 
-        # Neural field MLP
-        self.field_mlp = NeuralFieldMLP()
+        # DiT blocks for global processing
+        for _ in range(num_cond_blocks):
+            self.blocks.append(
+                DiTBlock3D(hidden_size, num_heads, mlp_ratio)
+            )
 
-        # Store config
-        self.encoder_type = encoder_type
-        self.d_context = d_context
+        # NerfBlocks for local neural field
+        for _ in range(num_cond_blocks, num_blocks):
+            self.blocks.append(
+                NerfBlock(hidden_size, hidden_size_x, nerf_mlp_ratio)
+            )
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor,
-                condition: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Final layer
+        self.final_layer = NerfFinalLayer(hidden_size_x, out_channels)
+
+        # Initialize weights
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        """Initialize weights following PixNerd."""
+        # Point embedder
+        nn.init.xavier_uniform_(self.point_embedder.proj.weight)
+        nn.init.zeros_(self.point_embedder.proj.bias)
+
+        # Timestep embedder
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Class embedder
+        if self.y_embedder is not None:
+            nn.init.normal_(self.y_embedder.weight, std=0.02)
+
+        # Final layer - zero init (from PixNerd)
+        nn.init.zeros_(self.final_layer.linear.weight)
+        nn.init.zeros_(self.final_layer.linear.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Predict velocity field at given points and time.
+        Forward pass predicting velocity field.
 
         Args:
-            x_t: Noised point positions [B, N, 3]
-            t: Diffusion timestep [B] or scalar in [0, 1]
-            condition: Optional conditioning (e.g., class label)
+            x: Point cloud [B, N, 3]
+            t: Timestep [B] in [0, 1]
+            y: Optional class labels [B]
+            mask: Optional attention mask
 
         Returns:
-            Predicted velocities [B, N, 3]
+            Predicted velocity [B, N, 3]
         """
-        B, N, _ = x_t.shape
+        B, N, C = x.shape
+        positions = x.clone()  # Store positions for RoPE and NerfBlocks
 
-        # 1. Encode shape context from noised points
-        context = self.encoder(x_t)  # [B, d_context]
+        # Timestep embedding
+        t_emb = self.t_embedder(t.view(-1))  # [B, hidden_size]
 
-        # 2. Generate neural field weights
-        d_pos_enc = self.pos_encoder.d_output
-        weights, biases = self.hyper_net(context, t, d_pos_enc)
+        # Condition embedding
+        if self.y_embedder is not None and y is not None:
+            y_emb = self.y_embedder(y)  # [B, hidden_size]
+            c = F.silu(t_emb + y_emb)
+        else:
+            c = F.silu(t_emb)
 
-        # 3. Encode query positions
-        pos_enc = self.pos_encoder(x_t)  # [B, N, d_pos_enc]
+        # Point embedding for global processing
+        s = self.point_embedder(x)  # [B, N, hidden_size]
 
-        # 4. Apply neural field to get velocities
-        velocities = self.field_mlp(pos_enc, weights, biases)  # [B, N, 3]
+        # Global DiT blocks
+        for i in range(self.num_cond_blocks):
+            s = self.blocks[i](s, c, positions, mask)
 
-        return velocities
+        # Combine with timestep for NerfBlocks (like PixNerd)
+        s = F.silu(t_emb.unsqueeze(1) + s)  # [B, N, hidden_size]
 
-    def query_field(self, query_points: torch.Tensor, t: torch.Tensor,
-                    context: torch.Tensor) -> torch.Tensor:
+        # Position encoding for local processing
+        x = self.nerf_embedder(positions)  # [B, N, hidden_size_x]
+
+        # Local NerfBlocks
+        # Pool shape context for each point
+        s_pooled = s.mean(dim=1)  # [B, hidden_size] - global shape context
+
+        for i in range(self.num_cond_blocks, self.num_blocks):
+            x = self.blocks[i](x, s_pooled)
+
+        # Final projection to velocity
+        x = self.final_layer(x)  # [B, N, out_channels]
+
+        return x
+
+    def get_context(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Extract shape context for resolution-independent sampling.
+
+        Args:
+            x: Point cloud [B, N, 3]
+            t: Timestep [B]
+
+        Returns:
+            Shape context [B, hidden_size]
+        """
+        B, N, C = x.shape
+        positions = x.clone()
+
+        t_emb = self.t_embedder(t.view(-1))
+        c = F.silu(t_emb)
+
+        s = self.point_embedder(x)
+
+        for i in range(self.num_cond_blocks):
+            s = self.blocks[i](s, c, positions)
+
+        s = F.silu(t_emb.unsqueeze(1) + s)
+        s_pooled = s.mean(dim=1)
+
+        return s_pooled
+
+    def query_field(
+        self,
+        query_points: torch.Tensor,
+        t: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Query the neural field at arbitrary points given pre-computed context.
 
-        This is the key capability: once we have shape context, we can
-        query the velocity field at ANY spatial location.
+        This enables resolution-independent generation: compute context once,
+        then query at any number of points.
 
         Args:
-            query_points: Query positions [B, M, 3] (M can differ from training N)
-            t: Diffusion timestep
-            context: Pre-computed shape context [B, d_context]
+            query_points: Query positions [B, M, 3]
+            t: Timestep [B]
+            context: Pre-computed shape context [B, hidden_size]
 
         Returns:
             Velocities at query points [B, M, 3]
         """
-        # Generate field weights from context
-        d_pos_enc = self.pos_encoder.d_output
-        weights, biases = self.hyper_net(context, t, d_pos_enc)
+        # Position encoding for query points
+        x = self.nerf_embedder(query_points)  # [B, M, hidden_size_x]
 
-        # Encode query positions
-        pos_enc = self.pos_encoder(query_points)
+        # Apply NerfBlocks with pre-computed context
+        for i in range(self.num_cond_blocks, self.num_blocks):
+            x = self.blocks[i](x, context)
 
-        # Apply field
-        velocities = self.field_mlp(pos_enc, weights, biases)
+        # Final projection
+        x = self.final_layer(x)
 
-        return velocities
+        return x
 
-    def get_context(self, points: torch.Tensor) -> torch.Tensor:
-        """
-        Extract shape context from a point cloud.
 
-        Args:
-            points: Point cloud [B, N, 3]
-
-        Returns:
-            Shape context [B, d_context]
-        """
-        return self.encoder(points)
-
+# =============================================================================
+# TESTING
+# =============================================================================
 
 def test_model():
     """Test the neural field model."""
-    print("Testing NeuralFieldDiffusion...")
+    print("Testing NeuralFieldDiffusion (PixNerd-style)...")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    # Create model
+    # Create model with PixNerd-style config
     model = NeuralFieldDiffusion(
-        encoder_type='pointnet',
-        d_hidden=64,
-        d_context=128,
-        n_frequencies=6,
-        field_hidden=64,
-        field_layers=3
+        in_channels=3,
+        out_channels=3,
+        hidden_size=384,
+        hidden_size_x=64,
+        num_heads=6,
+        num_blocks=12,
+        num_cond_blocks=4,
+        nerf_mlp_ratio=4,
+        max_freqs=8,
     ).to(device)
 
     # Count parameters
@@ -555,21 +763,24 @@ def test_model():
 
     # Test forward pass
     B, N = 4, 256
-    x_t = torch.randn(B, N, 3, device=device)
+    x = torch.randn(B, N, 3, device=device)
     t = torch.rand(B, device=device)
 
-    v = model(x_t, t)
-    print(f"Input shape: {x_t.shape}")
+    v = model(x, t)
+    print(f"Input shape: {x.shape}")
     print(f"Output shape: {v.shape}")
 
-    # Test query at different resolution
-    M = 1024
-    context = model.get_context(x_t)
-    query_points = torch.randn(B, M, 3, device=device)
-    v_query = model.query_field(query_points, t, context)
-    print(f"Query at {M} points: {v_query.shape}")
+    # Test context extraction
+    context = model.get_context(x, t)
+    print(f"Context shape: {context.shape}")
 
-    print("All tests passed!")
+    # Test field query at different resolutions
+    for M in [64, 128, 256, 512, 1024]:
+        query = torch.randn(B, M, 3, device=device)
+        v_query = model.query_field(query, t, context)
+        print(f"Query {M} points: {v_query.shape}")
+
+    print("\nAll tests passed!")
 
 
 if __name__ == "__main__":
