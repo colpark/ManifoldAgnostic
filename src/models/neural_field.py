@@ -220,6 +220,8 @@ class RoPEAttention3D(nn.Module):
     """
     Multi-head attention with 3D Rotary Position Embeddings.
     Adapted from PixNerd's RAttention for 3D point clouds.
+
+    Supports double backward (needed for SDF gradient computation).
     """
     def __init__(
         self,
@@ -236,6 +238,7 @@ class RoPEAttention3D(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
 
         # Ensure head_dim is divisible by 6 for 3D RoPE
         # If not, we'll pad internally
@@ -287,8 +290,14 @@ class RoPEAttention3D(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Scaled dot-product attention
-        x = scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        # Manual attention (supports double backward, needed for SDF gradients)
+        # scaled_dot_product_attention doesn't support second-order derivatives
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        if mask is not None:
+            attn = attn + mask
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
