@@ -1,0 +1,15 @@
+# Neural Field Diffusion for Point Clouds
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# For notebooks
+jupyter>=1.0.0
+pandas>=2.0.0
+
+# Optional: for faster data loading
+# h5py>=3.8.0
