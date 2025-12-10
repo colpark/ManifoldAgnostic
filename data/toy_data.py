@@ -71,6 +71,51 @@ class PointCloud:
         normals = self.normals[indices] if self.normals is not None else None
         return PointCloud(self.points[indices], normals, self.name, self.manifold_dim)
 
+    def random_rotate(self) -> 'PointCloud':
+        """Apply random 3D rotation."""
+        # Random rotation using QR decomposition of random matrix
+        random_matrix = np.random.randn(3, 3)
+        q, _ = np.linalg.qr(random_matrix)
+        # Ensure proper rotation (det = 1, not -1)
+        if np.linalg.det(q) < 0:
+            q[:, 0] *= -1
+        rotated = self.points @ q.T
+        normals = self.normals @ q.T if self.normals is not None else None
+        return PointCloud(rotated, normals, self.name, self.manifold_dim)
+
+    def random_scale(self, scale_range: Tuple[float, float] = (0.5, 1.5)) -> 'PointCloud':
+        """Apply random uniform scaling."""
+        scale = np.random.uniform(scale_range[0], scale_range[1])
+        scaled = self.points * scale
+        return PointCloud(scaled, self.normals, self.name, self.manifold_dim)
+
+    def random_anisotropic_scale(self, scale_range: Tuple[float, float] = (0.5, 1.5)) -> 'PointCloud':
+        """Apply random per-axis scaling (creates shape variation)."""
+        scales = np.random.uniform(scale_range[0], scale_range[1], size=3)
+        scaled = self.points * scales
+        # Normals need inverse transpose of scale matrix
+        if self.normals is not None:
+            normals = self.normals / scales
+            normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+        else:
+            normals = None
+        return PointCloud(scaled, normals, self.name, self.manifold_dim)
+
+    def random_transform(self,
+                        rotate: bool = True,
+                        scale_range: Optional[Tuple[float, float]] = (0.7, 1.3),
+                        anisotropic: bool = True) -> 'PointCloud':
+        """Apply random transformations for data augmentation."""
+        pc = self
+        if rotate:
+            pc = pc.random_rotate()
+        if scale_range is not None:
+            if anisotropic:
+                pc = pc.random_anisotropic_scale(scale_range)
+            else:
+                pc = pc.random_scale(scale_range)
+        return pc
+
 
 # =============================================================================
 # 1D MANIFOLDS (Curves)

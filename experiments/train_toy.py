@@ -42,52 +42,62 @@ class PointCloudDataset(Dataset):
     """
     Dataset of point clouds for training.
 
-    Each sample is a normalized point cloud with optional noise augmentation.
+    Each sample is a normalized point cloud with random transformations
+    to create variation across samples.
     """
 
-    def __init__(self, shape: str = 'sphere', n_samples: int = 1000,
-                 n_points: int = 256, noise_std: float = 0.0,
-                 resample_each_epoch: bool = True):
+    def __init__(self, shapes: List[str] = ['sphere'], n_samples: int = 1000,
+                 n_points: int = 256, noise_std: float = 0.001,
+                 random_transform: bool = True,
+                 scale_range: tuple = (0.7, 1.3)):
         """
         Args:
-            shape: Shape type ('sphere', 'torus', 'helix', etc.)
+            shapes: List of shape types (supports multi-shape training)
             n_samples: Number of samples in dataset
             n_points: Points per sample
             noise_std: Gaussian noise std for augmentation
-            resample_each_epoch: If True, resample points each access
+            random_transform: Apply random rotation + anisotropic scaling
+            scale_range: Range for random scaling (creates shape variation)
         """
-        self.shape = shape
+        self.shapes = shapes if isinstance(shapes, list) else [shapes]
         self.n_samples = n_samples
         self.n_points = n_points
         self.noise_std = noise_std
-        self.resample = resample_each_epoch
+        self.random_transform = random_transform
+        self.scale_range = scale_range
 
-        # Get generator
-        generators = get_all_generators()
-        if shape not in generators:
-            raise ValueError(f"Unknown shape: {shape}. Available: {list(generators.keys())}")
-        self.generator = generators[shape]
-
-        # Pre-generate if not resampling
-        if not resample_each_epoch:
-            self.data = []
-            for _ in range(n_samples):
-                pc = self.generator(n_points=n_points).normalize()
-                if noise_std > 0:
-                    pc = pc.add_noise(noise_std)
-                self.data.append(torch.tensor(pc.points, dtype=torch.float32))
+        # Get generators
+        all_generators = get_all_generators()
+        self.generators = []
+        for shape in self.shapes:
+            if shape not in all_generators:
+                raise ValueError(f"Unknown shape: {shape}. Available: {list(all_generators.keys())}")
+            self.generators.append(all_generators[shape])
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
-        if self.resample:
-            pc = self.generator(n_points=self.n_points).normalize()
-            if self.noise_std > 0:
-                pc = pc.add_noise(self.noise_std)
-            return torch.tensor(pc.points, dtype=torch.float32)
-        else:
-            return self.data[idx]
+        # Randomly select shape if multi-shape
+        generator = self.generators[idx % len(self.generators)]
+
+        # Generate base point cloud
+        pc = generator(n_points=self.n_points)
+
+        # Apply random transformations (creates variation!)
+        if self.random_transform:
+            pc = pc.random_transform(
+                rotate=True,
+                scale_range=self.scale_range,
+                anisotropic=True  # Different scaling per axis = shape variation
+            )
+
+        # Normalize and add noise
+        pc = pc.normalize()
+        if self.noise_std > 0:
+            pc = pc.add_noise(self.noise_std)
+
+        return torch.tensor(pc.points, dtype=torch.float32)
 
 
 class Trainer:
@@ -332,27 +342,29 @@ def main():
     parser = argparse.ArgumentParser(description='Train Neural Field Diffusion')
 
     # Data
-    parser.add_argument('--shape', type=str, default='sphere',
-                        help='Shape to train on')
+    parser.add_argument('--shapes', type=str, nargs='+', default=['torus'],
+                        help='Shape(s) to train on (e.g., --shapes torus sphere helix)')
     parser.add_argument('--n_points', type=int, default=256,
                         help='Points per cloud (256-512 recommended)')
     parser.add_argument('--n_samples', type=int, default=1000,
                         help='Number of training samples')
+    parser.add_argument('--no_transform', action='store_true',
+                        help='Disable random transforms (rotation + anisotropic scale)')
 
-    # Model (PixNerd-style architecture)
-    parser.add_argument('--hidden_size', type=int, default=384,
-                        help='Transformer hidden dimension')
-    parser.add_argument('--hidden_size_x', type=int, default=64,
-                        help='NerfBlock hidden dimension')
-    parser.add_argument('--num_heads', type=int, default=6,
+    # Model (SMALL config for toy data - PixNerd-style architecture)
+    parser.add_argument('--hidden_size', type=int, default=128,
+                        help='Transformer hidden dimension (128 for toy)')
+    parser.add_argument('--hidden_size_x', type=int, default=32,
+                        help='NerfBlock hidden dimension (32 for toy)')
+    parser.add_argument('--num_heads', type=int, default=4,
                         help='Number of attention heads')
-    parser.add_argument('--num_blocks', type=int, default=12,
-                        help='Total number of blocks')
-    parser.add_argument('--num_cond_blocks', type=int, default=4,
+    parser.add_argument('--num_blocks', type=int, default=6,
+                        help='Total number of blocks (6 for toy)')
+    parser.add_argument('--num_cond_blocks', type=int, default=2,
                         help='Number of DiT blocks (rest are NerfBlocks)')
-    parser.add_argument('--nerf_mlp_ratio', type=int, default=4,
+    parser.add_argument('--nerf_mlp_ratio', type=int, default=2,
                         help='MLP ratio for NerfBlocks')
-    parser.add_argument('--max_freqs', type=int, default=8,
+    parser.add_argument('--max_freqs', type=int, default=6,
                         help='Fourier frequency bands')
 
     # Training
@@ -387,18 +399,21 @@ def main():
     print(f"Using device: {device}")
 
     # Create save directory
-    save_dir = os.path.join(args.save_dir, f'{args.shape}_{args.n_points}pts')
+    shapes_str = '_'.join(args.shapes)
+    save_dir = os.path.join(args.save_dir, f'{shapes_str}_{args.n_points}pts')
     os.makedirs(save_dir, exist_ok=True)
     print(f"Saving to: {save_dir}")
 
-    # Create dataset
-    print(f"\nCreating dataset: {args.shape} with {args.n_points} points")
+    # Create dataset with random transforms for variation
+    print(f"\nCreating dataset: {args.shapes} with {args.n_points} points")
+    print(f"Random transforms: {not args.no_transform} (rotation + anisotropic scaling)")
     dataset = PointCloudDataset(
-        shape=args.shape,
+        shapes=args.shapes,
         n_samples=args.n_samples,
         n_points=args.n_points,
-        noise_std=0.001,  # Small noise for augmentation
-        resample_each_epoch=True
+        noise_std=0.001,
+        random_transform=not args.no_transform,
+        scale_range=(0.7, 1.3)  # Creates ellipsoids from spheres, etc.
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
