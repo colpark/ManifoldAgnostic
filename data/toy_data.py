@@ -573,6 +573,138 @@ def generate_shell(n_points: int = 1024, r_inner: float = 0.5,
 
 
 # =============================================================================
+# MULTI-OBJECT SCENES
+# =============================================================================
+
+def generate_multi_sphere(n_points: int = 1024, n_spheres: int = 8,
+                          arrangement: str = 'cube',
+                          base_radius: float = 0.15,
+                          spread: float = 0.7,
+                          jitter_position: float = 0.1,
+                          jitter_radius: float = 0.05) -> PointCloud:
+    """
+    Generate multiple small spheres arranged in 3D space.
+
+    The relative positions follow a parametric rule with controlled randomness,
+    creating meaningful variation across samples while maintaining structure.
+
+    Args:
+        n_points: Total points across all spheres
+        n_spheres: Number of spheres (default 8)
+        arrangement: Base arrangement pattern
+            - 'cube': Spheres at vertices of a cube
+            - 'ring': Spheres in a ring pattern
+            - 'random': Random positions in bounding box
+            - 'grid': 2x2x2 grid with jitter
+        base_radius: Base radius of each sphere
+        spread: Overall spread of the arrangement
+        jitter_position: Random position offset (relative to spread)
+        jitter_radius: Random radius variation (relative to base_radius)
+
+    Returns:
+        PointCloud with multiple spheres as a single point set
+    """
+    points_per_sphere = n_points // n_spheres
+    all_points = []
+
+    # Generate base positions based on arrangement
+    if arrangement == 'cube':
+        # 8 vertices of a cube
+        base_positions = np.array([
+            [-1, -1, -1], [-1, -1, +1], [-1, +1, -1], [-1, +1, +1],
+            [+1, -1, -1], [+1, -1, +1], [+1, +1, -1], [+1, +1, +1],
+        ], dtype=np.float64) * spread / np.sqrt(3)
+
+    elif arrangement == 'ring':
+        # Spheres arranged in a ring on XY plane
+        angles = np.linspace(0, 2 * np.pi, n_spheres, endpoint=False)
+        # Add random angle offset to vary the ring orientation
+        angle_offset = np.random.uniform(0, 2 * np.pi)
+        angles = angles + angle_offset
+        base_positions = np.stack([
+            spread * np.cos(angles),
+            spread * np.sin(angles),
+            np.zeros(n_spheres)
+        ], axis=1)
+
+    elif arrangement == 'random':
+        # Random positions in a cube
+        base_positions = (np.random.rand(n_spheres, 3) - 0.5) * 2 * spread
+
+    elif arrangement == 'grid':
+        # 2x2x2 grid
+        coords = np.array([-1, 1]) * spread / np.sqrt(3)
+        xx, yy, zz = np.meshgrid(coords, coords, coords)
+        base_positions = np.stack([xx.flatten(), yy.flatten(), zz.flatten()], axis=1)
+
+    else:
+        raise ValueError(f"Unknown arrangement: {arrangement}")
+
+    # Ensure we have exactly n_spheres positions
+    if len(base_positions) < n_spheres:
+        # Repeat if needed
+        repeats = (n_spheres // len(base_positions)) + 1
+        base_positions = np.tile(base_positions, (repeats, 1))[:n_spheres]
+    elif len(base_positions) > n_spheres:
+        base_positions = base_positions[:n_spheres]
+
+    # Add position jitter (THIS CREATES VARIATION BETWEEN SAMPLES!)
+    position_noise = np.random.randn(n_spheres, 3) * jitter_position * spread
+    positions = base_positions + position_noise
+
+    # Generate each sphere with radius variation
+    for i in range(n_spheres):
+        # Vary radius per sphere
+        radius = base_radius * (1 + np.random.uniform(-jitter_radius, jitter_radius))
+
+        # Sample points on sphere surface using Fibonacci method
+        n_pts = points_per_sphere if i < n_spheres - 1 else (n_points - len(all_points))
+
+        # Golden angle method for uniform distribution
+        indices = np.arange(n_pts, dtype=np.float64)
+        phi = np.arccos(1 - 2 * (indices + 0.5) / n_pts)
+        theta = np.pi * (1 + np.sqrt(5)) * indices
+
+        x = radius * np.sin(phi) * np.cos(theta) + positions[i, 0]
+        y = radius * np.sin(phi) * np.sin(theta) + positions[i, 1]
+        z = radius * np.cos(phi) + positions[i, 2]
+
+        sphere_points = np.stack([x, y, z], axis=1)
+        all_points.append(sphere_points)
+
+    points = np.vstack(all_points)
+
+    return PointCloud(points, None, f"multi_sphere_{n_spheres}", ManifoldDim.SURFACE_2D)
+
+
+def generate_multi_sphere_cube(n_points: int = 1024) -> PointCloud:
+    """8 spheres at cube vertices with position/radius jitter."""
+    return generate_multi_sphere(
+        n_points=n_points, n_spheres=8, arrangement='cube',
+        base_radius=0.15, spread=0.7,
+        jitter_position=0.15, jitter_radius=0.3
+    )
+
+
+def generate_multi_sphere_ring(n_points: int = 1024) -> PointCloud:
+    """8 spheres in a ring with position/radius jitter."""
+    return generate_multi_sphere(
+        n_points=n_points, n_spheres=8, arrangement='ring',
+        base_radius=0.12, spread=0.6,
+        jitter_position=0.1, jitter_radius=0.25
+    )
+
+
+def generate_multi_sphere_random(n_points: int = 1024) -> PointCloud:
+    """8 spheres at random positions."""
+    return generate_multi_sphere(
+        n_points=n_points, n_spheres=8, arrangement='random',
+        base_radius=0.15, spread=0.7,
+        jitter_position=0.0, jitter_radius=0.3  # Already random, no extra jitter
+    )
+
+
+# =============================================================================
 # DATASET COLLECTION
 # =============================================================================
 
@@ -595,6 +727,10 @@ def get_all_generators() -> Dict[str, callable]:
         "ball_volume": generate_ball_volume,
         "ellipsoid_volume": generate_ellipsoid_volume,
         "shell": generate_shell,
+        # Multi-Object Scenes
+        "multi_sphere_cube": generate_multi_sphere_cube,
+        "multi_sphere_ring": generate_multi_sphere_ring,
+        "multi_sphere_random": generate_multi_sphere_random,
     }
 
 

@@ -19,6 +19,11 @@ from .toy_data import (
     generate_ball_volume,
     generate_ellipsoid_volume,
     generate_shell,
+    # Multi-Object Scenes
+    generate_multi_sphere,
+    generate_multi_sphere_cube,
+    generate_multi_sphere_ring,
+    generate_multi_sphere_random,
     # Utilities
     get_all_generators,
     get_shapes_by_dimension,
@@ -42,6 +47,10 @@ __all__ = [
     'generate_ball_volume',
     'generate_ellipsoid_volume',
     'generate_shell',
+    'generate_multi_sphere',
+    'generate_multi_sphere_cube',
+    'generate_multi_sphere_ring',
+    'generate_multi_sphere_random',
     'get_all_generators',
     'get_shapes_by_dimension',
     'generate_dataset',
