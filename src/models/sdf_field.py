@@ -258,23 +258,26 @@ class SDFNeuralField(nn.Module):
         Returns:
             Velocity field [B, N, 3]
         """
-        # Enable gradients for input
-        x_grad = x.clone().requires_grad_(True)
+        # Use torch.enable_grad() to ensure gradients work even in no_grad context
+        # (needed for sampling with @torch.no_grad() decorator)
+        with torch.enable_grad():
+            # Enable gradients for input
+            x_grad = x.clone().requires_grad_(True)
 
-        # Forward to get SDF
-        sdf = self.forward_sdf(x_grad, t, y, mask)  # [B, N, 1]
+            # Forward to get SDF
+            sdf = self.forward_sdf(x_grad, t, y, mask)  # [B, N, 1]
 
-        # Compute gradient w.r.t. input positions
-        # Sum SDF values to get scalar for backward
-        sdf_sum = sdf.sum()
+            # Compute gradient w.r.t. input positions
+            # Sum SDF values to get scalar for backward
+            sdf_sum = sdf.sum()
 
-        # Compute gradient
-        grad = torch.autograd.grad(
-            outputs=sdf_sum,
-            inputs=x_grad,
-            create_graph=self.training,  # Keep graph for training
-            retain_graph=self.training,
-        )[0]  # [B, N, 3]
+            # Compute gradient
+            grad = torch.autograd.grad(
+                outputs=sdf_sum,
+                inputs=x_grad,
+                create_graph=self.training,  # Keep graph for training
+                retain_graph=self.training,
+            )[0]  # [B, N, 3]
 
         # Velocity is negative gradient (points toward decreasing SDF = toward surface)
         velocity = -grad
@@ -345,27 +348,29 @@ class SDFNeuralField(nn.Module):
         Returns:
             Velocities at query points [B, M, 3]
         """
-        # Enable gradients
-        query_grad = query_points.clone().requires_grad_(True)
+        # Use torch.enable_grad() to ensure gradients work even in no_grad context
+        with torch.enable_grad():
+            # Enable gradients
+            query_grad = query_points.clone().requires_grad_(True)
 
-        # Position encoding for query points
-        feat = self.nerf_embedder(query_grad)  # [B, M, hidden_size_x]
+            # Position encoding for query points
+            feat = self.nerf_embedder(query_grad)  # [B, M, hidden_size_x]
 
-        # Apply NerfBlocks with pre-computed context
-        for i in range(self.num_cond_blocks, self.num_blocks):
-            feat = self.blocks[i](feat, context)
+            # Apply NerfBlocks with pre-computed context
+            for i in range(self.num_cond_blocks, self.num_blocks):
+                feat = self.blocks[i](feat, context)
 
-        # Get SDF
-        sdf = self.final_layer(feat)  # [B, M, 1]
+            # Get SDF
+            sdf = self.final_layer(feat)  # [B, M, 1]
 
-        # Compute gradient
-        sdf_sum = sdf.sum()
-        grad = torch.autograd.grad(
-            outputs=sdf_sum,
-            inputs=query_grad,
-            create_graph=self.training,
-            retain_graph=self.training,
-        )[0]
+            # Compute gradient
+            sdf_sum = sdf.sum()
+            grad = torch.autograd.grad(
+                outputs=sdf_sum,
+                inputs=query_grad,
+                create_graph=self.training,
+                retain_graph=self.training,
+            )[0]
 
         velocity = -grad
 
