@@ -36,8 +36,9 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data and models
-data/
+# Data and models (keep source code, ignore generated data)
+data/samples/
+data/*.npy
 datasets/
 checkpoints/
 *.pt
