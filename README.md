@@ -81,6 +81,28 @@ The architecture directly follows PixNerd (Wang et al.), adapting it from 2D ima
 
 The key insight from PixNerd's NerfBlock: the **hyper-network generates normalized MLP weights** that define a continuous function, enabling evaluation at any coordinate.
 
+## Two Approaches: Direct Velocity vs SDF-Based
+
+### Option 1: Direct Velocity Prediction (Original)
+```
+Model: v_θ(x, t) ∈ ℝ³ (direct velocity output)
+Training: MSE on predicted vs target velocity
+```
+
+### Option 2: SDF-Based (New - Smoother Training)
+```
+Model: f_θ(x, t) ∈ ℝ (scalar distance field)
+Velocity: v_θ(x, t) = -∇_x f_θ(x, t) (gradient-derived)
+Benefits: Smoother training, implicit surface representation
+```
+
+| Approach | Output | Training Stability | Surface Rep |
+|----------|--------|-------------------|-------------|
+| Direct velocity | v(x,t) ∈ ℝ³ | May have discontinuities | Implicit |
+| SDF-based | f(x,t) ∈ ℝ | Smoother gradients | Explicit SDF |
+
+The SDF approach is mathematically equivalent in expressiveness but often easier to train because the scalar field gradients are naturally continuous.
+
 ## Mathematical Framework
 
 ### Forward Process (Noise Addition)
@@ -102,6 +124,12 @@ L(θ) = E_{t,x₀,ε}[||v_θ(x_t, t) - v_target(x_t, t)||²]
 where:
   x_t = α(t)x₀ + σ(t)ε           (noised sample)
   v_target = α'(t)x₀ + σ'(t)ε    (target velocity)
+```
+
+For the SDF approach, velocity is computed via autograd:
+```python
+sdf = model.forward_sdf(x, t)  # Scalar output
+velocity = -torch.autograd.grad(sdf.sum(), x)[0]  # v = -∇f
 ```
 
 ### Manifold Convergence (Lemma 1)
@@ -151,37 +179,44 @@ ManifoldAgnostic/
 ├── requirements.txt             # Dependencies (torch, numpy, etc.)
 ├── data/
 │   ├── __init__.py
-│   └── toy_data.py              # Toy dataset (13 shapes across 1D/2D/3D)
+│   └── toy_data.py              # Toy dataset (16 shapes):
+│                                #   - 4 curves (1D), 5 surfaces (2D), 4 volumes (3D)
+│                                #   - 3 multi-object scenes (8 spheres with jitter)
 ├── notebooks/
 │   ├── visualize_data.ipynb     # Data visualization
-│   └── train_and_test.ipynb     # Training notebook
+│   ├── train_and_test.ipynb     # Velocity-based training notebook
+│   └── train_sdf.ipynb          # SDF-based training notebook
 ├── src/
 │   ├── models/
 │   │   ├── __init__.py
-│   │   └── neural_field.py      # PixNerd-style model:
-│   │                            #   - RMSNorm, SwiGLU, TimestepEmbedder
-│   │                            #   - RoPEAttention3D, DiTBlock3D
-│   │                            #   - NerfEmbedder3D, NerfBlock
-│   │                            #   - NeuralFieldDiffusion (main model)
+│   │   ├── neural_field.py      # NeuralFieldDiffusion (velocity-based):
+│   │   │                        #   - RMSNorm, SwiGLU, TimestepEmbedder
+│   │   │                        #   - RoPEAttention3D, DiTBlock3D
+│   │   │                        #   - NerfEmbedder3D, NerfBlock
+│   │   └── sdf_field.py         # SDFNeuralField (SDF-based):
+│   │                            #   - Scalar output, gradient-derived velocity
+│   │                            #   - SDFFlowMatchingLoss with eikonal option
 │   ├── diffusion/
 │   │   ├── __init__.py
 │   │   └── flow_matching.py     # FlowMatchingLoss, FlowMatchingSampler
 │   └── utils/
 │       └── __init__.py
 └── experiments/
-    ├── train_toy.py             # CLI training script
+    ├── train_toy.py             # CLI training (velocity-based)
+    ├── train_sdf.py             # CLI training (SDF-based)
     └── outputs/                 # Training outputs (samples, checkpoints)
 ```
 
 ## Roadmap
 
 - [x] Theoretical framework and README
-- [ ] Toy point cloud datasets (curves, surfaces, volumes)
-- [ ] Core neural field architecture
-- [ ] Flow matching training loop
-- [ ] ODE sampling with arbitrary resolution
+- [x] Toy point cloud datasets (16 shapes: curves, surfaces, volumes, multi-object)
+- [x] Core neural field architecture (PixNerd-style DiT + NerfBlocks)
+- [x] Flow matching training loop
+- [x] ODE sampling with arbitrary resolution
+- [x] SDF-based approach (scalar field, gradient-derived velocity)
 - [ ] Evaluation metrics (Chamfer, EMD, Coverage)
-- [ ] Geometric analysis (normal extraction, SDF recovery)
+- [ ] Geometric analysis (normal extraction from field)
 - [ ] ShapeNet experiments
 - [ ] Conditional generation
 

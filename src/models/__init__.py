@@ -1,7 +1,7 @@
 """Neural field models for point cloud generation (PixNerd-style architecture)."""
 
 from .neural_field import (
-    # Main model
+    # Main model (velocity-based)
     NeuralFieldDiffusion,
     # Core components from PixNerd
     RMSNorm,
@@ -19,9 +19,18 @@ from .neural_field import (
     apply_rotary_emb_3d,
 )
 
+from .sdf_field import (
+    # SDF-based model (scalar field, gradient-derived velocity)
+    SDFNeuralField,
+    SDFFlowMatchingLoss,
+)
+
 __all__ = [
-    # Main model
-    'NeuralFieldDiffusion',
+    # Main models
+    'NeuralFieldDiffusion',  # Velocity-based
+    'SDFNeuralField',        # SDF-based (smoother training)
+    # SDF-specific loss
+    'SDFFlowMatchingLoss',
     # Core components
     'RMSNorm',
     'SwiGLUFeedForward',
