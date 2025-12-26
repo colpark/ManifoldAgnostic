@@ -131,10 +131,11 @@ def unsort_points(sorted_tensor: torch.Tensor,
 # PATCHIFICATION
 # =============================================================================
 
-def patchify_points(points: torch.Tensor, patch_size: int = 16) -> Tuple[torch.Tensor, torch.Tensor]:
+def patchify_points(points: torch.Tensor, patch_size: int = 16) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
     Group consecutive points into patches.
     Points should already be sorted by space-filling curve.
+    If N is not divisible by patch_size, pads with repeated last points.
 
     Args:
         points: Sorted points [B, N, 3]
@@ -143,15 +144,24 @@ def patchify_points(points: torch.Tensor, patch_size: int = 16) -> Tuple[torch.T
     Returns:
         patches: Grouped points [B, num_patches, patch_size, 3]
         patch_centers: Center of each patch [B, num_patches, 3]
+        original_n: Original number of points before padding
     """
     B, N, C = points.shape
-    assert N % patch_size == 0, f"N ({N}) must be divisible by patch_size ({patch_size})"
+    original_n = N
+
+    # Pad if necessary
+    if N % patch_size != 0:
+        pad_size = patch_size - (N % patch_size)
+        # Pad by repeating the last point
+        padding = points[:, -1:, :].expand(-1, pad_size, -1)
+        points = torch.cat([points, padding], dim=1)
+        N = points.shape[1]
 
     num_patches = N // patch_size
     patches = points.reshape(B, num_patches, patch_size, C)
     patch_centers = patches.mean(dim=2)  # [B, num_patches, 3]
 
-    return patches, patch_centers
+    return patches, patch_centers, original_n
 
 
 def unpatchify_points(patches: torch.Tensor) -> torch.Tensor:
@@ -519,16 +529,15 @@ class PatchedNeuralFieldDiffusion(nn.Module):
         Returns:
             Velocity field [B, N, 3]
         """
-        B, N, _ = x.shape
+        B, N_orig, _ = x.shape
 
         # 1. Sort by space-filling curve
         sorted_x, sort_indices = sort_by_space_filling_curve(x)
 
-        # 2. Patchify
-        patches, patch_centers = patchify_points(sorted_x, self.patch_size)
+        # 2. Patchify (handles padding if N not divisible by patch_size)
+        patches, patch_centers, original_n = patchify_points(sorted_x, self.patch_size)
         # patches: [B, P, K, 3], patch_centers: [B, P, 3]
         P = patches.shape[1]
-        K = self.patch_size
 
         # 3. Embed points within patches
         point_features = self.point_embedder(patches)  # [B, P, K, hidden_size_x]
@@ -560,9 +569,14 @@ class PatchedNeuralFieldDiffusion(nn.Module):
         output = self.final_norm(query_features)
         output = self.final_layer(output)  # [B, P, K, 3]
 
-        # 9. Unpatchify and unsort
-        output = unpatchify_points(output)  # [B, N, 3]
-        output = unsort_points(output, sort_indices)  # [B, N, 3]
+        # 9. Unpatchify
+        output = unpatchify_points(output)  # [B, N_padded, 3]
+
+        # 10. Truncate to original size (remove padding)
+        output = output[:, :original_n, :]  # [B, N_orig, 3]
+
+        # 11. Unsort to original order
+        output = unsort_points(output, sort_indices)  # [B, N_orig, 3]
 
         return output
 
@@ -622,7 +636,7 @@ class PatchedNeuralFieldDiffusion(nn.Module):
 
         # Sort and patchify
         sorted_x, _ = sort_by_space_filling_curve(x)
-        patches, patch_centers = patchify_points(sorted_x, self.patch_size)
+        patches, patch_centers, _ = patchify_points(sorted_x, self.patch_size)
 
         # Embed and aggregate
         point_features = self.point_embedder(patches)
