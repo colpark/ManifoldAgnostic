@@ -704,6 +704,31 @@ def generate_multi_sphere_random(n_points: int = 1024) -> PointCloud:
     )
 
 
+def generate_two_spheres(n_points: int = 512) -> PointCloud:
+    """
+    Two spheres - simpler test case for multi-modal learning.
+
+    Spheres are placed at (-0.5, 0, 0) and (+0.5, 0, 0) with some jitter.
+    This is a minimal test case for verifying the model can learn multiple modes.
+    """
+    return generate_multi_sphere(
+        n_points=n_points, n_spheres=2, arrangement='ring',
+        base_radius=0.25, spread=0.5,
+        jitter_position=0.1, jitter_radius=0.15
+    )
+
+
+def generate_four_spheres(n_points: int = 512) -> PointCloud:
+    """
+    Four spheres at corners of a square - medium test case.
+    """
+    return generate_multi_sphere(
+        n_points=n_points, n_spheres=4, arrangement='ring',
+        base_radius=0.2, spread=0.55,
+        jitter_position=0.1, jitter_radius=0.2
+    )
+
+
 # =============================================================================
 # DATASET COLLECTION
 # =============================================================================
@@ -731,6 +756,8 @@ def get_all_generators() -> Dict[str, callable]:
         "multi_sphere_cube": generate_multi_sphere_cube,
         "multi_sphere_ring": generate_multi_sphere_ring,
         "multi_sphere_random": generate_multi_sphere_random,
+        "two_spheres": generate_two_spheres,
+        "four_spheres": generate_four_spheres,
     }
 
 
