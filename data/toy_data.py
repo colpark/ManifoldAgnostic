@@ -652,13 +652,30 @@ def generate_multi_sphere(n_points: int = 1024, n_spheres: int = 8,
     position_noise = np.random.randn(n_spheres, 3) * jitter_position * spread
     positions = base_positions + position_noise
 
-    # Generate each sphere with radius variation
-    for i in range(n_spheres):
-        # Vary radius per sphere
-        radius = base_radius * (1 + np.random.uniform(-jitter_radius, jitter_radius))
+    # Pre-compute radii for all spheres to allocate points proportionally
+    radii = np.array([
+        base_radius * (1 + np.random.uniform(-jitter_radius, jitter_radius))
+        for _ in range(n_spheres)
+    ])
 
-        # Sample points on sphere surface using Fibonacci method
-        n_pts = points_per_sphere if i < n_spheres - 1 else (n_points - len(all_points))
+    # Allocate points proportional to surface area (r^2) for equal density
+    surface_areas = radii ** 2
+    area_fractions = surface_areas / surface_areas.sum()
+    points_allocation = (area_fractions * n_points).astype(int)
+
+    # Distribute any remaining points to largest spheres
+    remaining = n_points - points_allocation.sum()
+    if remaining > 0:
+        largest_indices = np.argsort(radii)[-remaining:]
+        points_allocation[largest_indices] += 1
+
+    # Generate each sphere
+    for i in range(n_spheres):
+        radius = radii[i]
+        n_pts = points_allocation[i]
+
+        if n_pts == 0:
+            continue
 
         # Golden angle method for uniform distribution
         indices = np.arange(n_pts, dtype=np.float64)
