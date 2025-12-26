@@ -185,7 +185,8 @@ ManifoldAgnostic/
 ├── notebooks/
 │   ├── visualize_data.ipynb     # Data visualization
 │   ├── train_and_test.ipynb     # Velocity-based training notebook
-│   └── train_sdf.ipynb          # SDF-based training notebook
+│   ├── train_sdf.ipynb          # SDF-based training notebook
+│   └── train_shapenet.ipynb     # ShapeNetCore.v2 training notebook
 ├── src/
 │   ├── models/
 │   │   ├── __init__.py
@@ -210,15 +211,35 @@ ManifoldAgnostic/
 ## Roadmap
 
 - [x] Theoretical framework and README
-- [x] Toy point cloud datasets (16 shapes: curves, surfaces, volumes, multi-object)
+- [x] Toy point cloud datasets (16+ shapes: curves, surfaces, volumes, multi-object)
 - [x] Core neural field architecture (PixNerd-style DiT + NerfBlocks)
 - [x] Flow matching training loop
 - [x] ODE sampling with arbitrary resolution
 - [x] SDF-based approach (scalar field, gradient-derived velocity)
+- [x] Stochastic samplers (SDE, Annealed Langevin) for multi-modal data
+- [x] ShapeNet experiments (train_shapenet.ipynb)
 - [ ] Evaluation metrics (Chamfer, EMD, Coverage)
 - [ ] Geometric analysis (normal extraction from field)
-- [ ] ShapeNet experiments
-- [ ] Conditional generation
+- [ ] Conditional generation (category labels)
+
+## ShapeNet Training
+
+Train on real 3D shapes from [ShapeNetCore.v2](https://www.kaggle.com/datasets/hajareddagni/shapenetcorev2):
+
+```bash
+# 1. Download and extract to data/shapenet/ShapeNetCore.v2
+# 2. Install trimesh for mesh loading
+pip install trimesh
+
+# 3. Open notebooks/train_shapenet.ipynb
+```
+
+**Key differences from toy data**:
+- **More points**: 2048+ per shape (vs 256-512)
+- **Larger model**: ~10M params (HIDDEN_SIZE=384, NUM_BLOCKS=12)
+- **Categories**: airplane, car, chair, table, etc. (55 total)
+
+See `notebooks/train_shapenet.ipynb` for complete training pipeline
 
 ## References
 
