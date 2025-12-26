@@ -309,6 +309,117 @@ class FlowMatchingSampler:
         return x
 
     @torch.no_grad()
+    def sample_sde(self, noise: torch.Tensor, n_steps: int = 50,
+                   noise_scale: float = 0.1, decay: str = 'linear',
+                   return_trajectory: bool = False) -> torch.Tensor:
+        """
+        Sample with stochastic noise injection (SDE-like).
+
+        Adds Langevin-style noise to help explore multiple modes and
+        prevent mode collapse. Useful for multi-modal distributions
+        like multi-sphere scenes.
+
+        Args:
+            noise: Starting noise [B, N, 3]
+            n_steps: Number of integration steps
+            noise_scale: Base noise magnitude (try 0.05-0.2)
+            decay: How noise decays over time:
+                   'linear': noise_scale * t (more noise early, less late)
+                   'cosine': noise_scale * cos(π/2 * (1-t))
+                   'constant': noise_scale (same throughout)
+            return_trajectory: Whether to return full trajectory
+
+        Returns:
+            Generated samples [B, N, 3]
+        """
+        device = noise.device
+        B = noise.shape[0]
+
+        timesteps = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
+        dt = -1.0 / n_steps
+
+        x = noise.clone()
+        trajectory = [x.clone()] if return_trajectory else None
+
+        for i in range(n_steps):
+            t = timesteps[i].expand(B)
+            t_val = timesteps[i].item()
+
+            # Predict velocity
+            v = self.model(x, t)
+
+            # Euler step
+            x = x + v * dt
+
+            # Add stochastic noise (decays as we approach t=0)
+            if decay == 'linear':
+                current_noise = noise_scale * t_val
+            elif decay == 'cosine':
+                current_noise = noise_scale * math.cos(math.pi / 2 * (1 - t_val))
+            else:  # constant
+                current_noise = noise_scale
+
+            # Scale by sqrt(|dt|) for proper SDE discretization
+            x = x + current_noise * math.sqrt(abs(dt)) * torch.randn_like(x)
+
+            if return_trajectory:
+                trajectory.append(x.clone())
+
+        if return_trajectory:
+            return torch.stack(trajectory, dim=0)
+        return x
+
+    @torch.no_grad()
+    def sample_annealed(self, noise: torch.Tensor, n_steps: int = 50,
+                        n_langevin: int = 5, step_size: float = 0.01,
+                        return_trajectory: bool = False) -> torch.Tensor:
+        """
+        Sample with annealed Langevin dynamics at each step.
+
+        At each timestep, run a few Langevin steps to refine the sample
+        before moving to the next timestep. This helps find local modes.
+
+        Args:
+            noise: Starting noise [B, N, 3]
+            n_steps: Number of ODE integration steps
+            n_langevin: Langevin refinement steps per ODE step
+            step_size: Langevin step size
+            return_trajectory: Whether to return full trajectory
+        """
+        device = noise.device
+        B = noise.shape[0]
+
+        timesteps = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
+        dt = -1.0 / n_steps
+
+        x = noise.clone()
+        trajectory = [x.clone()] if return_trajectory else None
+
+        for i in range(n_steps):
+            t = timesteps[i].expand(B)
+            t_val = timesteps[i].item()
+
+            # ODE step
+            v = self.model(x, t)
+            x = x + v * dt
+
+            # Langevin refinement (more at high t, less at low t)
+            current_step = step_size * t_val
+            if current_step > 1e-6:
+                for _ in range(n_langevin):
+                    v = self.model(x, t)
+                    # Langevin: x = x + step * v + sqrt(2*step) * noise
+                    x = x + current_step * v * (-1)  # v points backward in time
+                    x = x + math.sqrt(2 * current_step) * torch.randn_like(x)
+
+            if return_trajectory:
+                trajectory.append(x.clone())
+
+        if return_trajectory:
+            return torch.stack(trajectory, dim=0)
+        return x
+
+    @torch.no_grad()
     def sample_at_resolution(self, context: torch.Tensor, n_points: int,
                              n_steps: int = 50) -> torch.Tensor:
         """
