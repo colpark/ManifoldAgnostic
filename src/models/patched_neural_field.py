@@ -558,8 +558,10 @@ class PatchedNeuralFieldDiffusion(nn.Module):
         # Each patch context generates its own NF
         patch_context = patch_tokens  # [B, P, hidden_size]
 
-        # Embed query points (same as input points for training)
-        query_features = self.nerf_embedder(patches)  # [B, P, K, hidden_size_x]
+        # Embed query points using RELATIVE position (offset from patch center)
+        # This gives more local variation within each patch
+        relative_pos = patches - patch_centers.unsqueeze(2)  # [B, P, K, 3]
+        query_features = self.nerf_embedder(relative_pos)  # [B, P, K, hidden_size_x]
 
         # Apply NerfBlocks
         for nerf_block in self.nerf_blocks:
@@ -598,11 +600,13 @@ class PatchedNeuralFieldDiffusion(nn.Module):
         B, M, _ = query_points.shape
         P = patch_context.shape[1]
 
-        # Embed query points
-        query_features = self.nerf_embedder(query_points)  # [B, M, hidden_size_x]
+        # Compute relative positions to EACH patch center
+        # query_points: [B, M, 3], patch_centers: [B, P, 3]
+        # Result: [B, P, M, 3] - relative position of each query to each patch
+        relative_pos = query_points.unsqueeze(1) - patch_centers.unsqueeze(2)  # [B, P, M, 3]
 
-        # Expand for each patch: [B, P, M, hidden_size_x]
-        query_features = query_features.unsqueeze(1).expand(-1, P, -1, -1)
+        # Embed using relative positions (different for each patch!)
+        query_features = self.nerf_embedder(relative_pos)  # [B, P, M, hidden_size_x]
 
         # Apply each patch's NerfBlocks
         for nerf_block in self.nerf_blocks:
