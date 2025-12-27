@@ -299,12 +299,14 @@ class PatchTransformerBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size)
         self.mlp = SwiGLUFeedForward(hidden_size, int(hidden_size * mlp_ratio))
 
-        # AdaLN modulation
+        # AdaLN modulation - use small random init (NOT zero-init)
+        # Zero-init would make transformer blocks identity initially, blocking learning
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
-        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        # Small init for stability, but NOT zero
+        nn.init.normal_(self.adaLN_modulation[1].weight, std=0.02)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -345,6 +347,11 @@ class PatchNerfBlock(nn.Module):
             2 * hidden_size_x * hidden_size_x * mlp_ratio,
             bias=True
         )
+        # Initialize to produce weights with reasonable magnitude before normalization
+        # This helps gradient flow through F.normalize
+        nn.init.normal_(self.param_generator.weight, std=0.02)
+        nn.init.zeros_(self.param_generator.bias)
+
         self.norm = RMSNorm(hidden_size_x)
 
     def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
